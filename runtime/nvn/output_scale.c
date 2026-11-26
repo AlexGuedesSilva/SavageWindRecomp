@@ -26,18 +26,26 @@
 #include "../settings.h"
 #include "output_scale.h"
 
+#ifndef __APPLE__
+extern bool vk_dlss_available(void);
+#endif
+
 #define MAX_TEX 16384.0
 #define SCENE_LINES 900.0  // the height of the game's 3D scene targets (docked)
 
 #ifndef __APPLE__
 bool fsr3_available(void);  // (vulkan/fsr3.h: built in)
+bool fsr4_available(void);  // (vulkan/fsr_api.h: AMD's DLLs, on an AMD Radeon)
 #endif
-// FSR 3 upscaling is held back until its cost on the thread that records the frame for Vulkan comes down (the draw
-// translation work in progress): today that thread limits 1080p and 1440p, and FSR 3's motion vectors make every mode
-// slower than native there. SAVAGEWIND_FSR3=1 offers it anyway (tests); TAA and frame generation stay as they are.
+// FSR 3 and FSR 4 upscaling were held back from 0.5.0 until the motion vectors left the render thread (recording them
+// there cost 1.2 ms a frame: RTX 3060, 1440p Quality, 130 fps native, 104 with FSR 3). Offered again since they are
+// worked out on a thread of their own (vulkan/mvec.c) and the shadow cascades follow the upscaler's factor
+// (shadow_map_size): same PC, Savage preset, 1440p, FSR 3 Quality over native at the Great Plateau 106 / 102,
+// Kakariko 106 / 88, Korok Forest 67 / 40. SAVAGEWIND_FSR3=0 hides them again (a settings file with fsr3 or fsr4 then
+// loads as FSR 1 with the same mode).
 bool fsr3_upscaler_enabled(void) {
     static int on = -1;
-    if (on < 0) on = getenv("SAVAGEWIND_FSR3") && atoi(getenv("SAVAGEWIND_FSR3")) != 0;
+    if (on < 0) on = !getenv("SAVAGEWIND_FSR3") || atoi(getenv("SAVAGEWIND_FSR3")) != 0;
     return on;
 }
 
@@ -45,17 +53,33 @@ bool upscaler_available(int u) {
 #ifdef __APPLE__
     return u == UPSCALE_OFF || u == UPSCALE_METALFX;
 #else
-    return u == UPSCALE_OFF || u == UPSCALE_FSR1 || (u == UPSCALE_FSR3 && fsr3_available() && fsr3_upscaler_enabled());
+    return u == UPSCALE_OFF || u == UPSCALE_FSR1 || (u == UPSCALE_FSR3 && fsr3_available() && fsr3_upscaler_enabled())
+        || (u == UPSCALE_FSR4 && fsr4_available() && fsr3_upscaler_enabled())  // (FSR 4: the same switch as FSR 3)
+        || (u == UPSCALE_DLSS && vk_dlss_available());
 #endif
 }
 
-bool rt_fsr3(void) { return g_settings.upscaler == UPSCALE_FSR3 && upscaler_available(UPSCALE_FSR3); }
+// FSR 4 is on this PC (an AMD Radeon, AMD's DLLs found), whether or not it is held back (the menu says which)
+bool fsr4_offered(void) {
+#ifdef __APPLE__
+    return false;
+#else
+    return fsr4_available();
+#endif
+}
 
-bool rt_temporal(void) { return rt_antialias() == AA_TAA || rt_fsr3(); }
+bool rt_fsr4(void) { return g_settings.upscaler == UPSCALE_FSR4 && upscaler_available(UPSCALE_FSR4); }
+// FSR 4 takes the same inputs and does the same jobs (anti-aliasing, sharpening) as FSR 3: everything that asks for
+// FSR 3 asks for either; vulkan/exec.c fsr3_scene picks the one to run
+bool rt_fsr3(void) { return (g_settings.upscaler == UPSCALE_FSR3 && upscaler_available(UPSCALE_FSR3)) || rt_fsr4(); }
+
+bool rt_dlss(void) { return g_settings.upscaler == UPSCALE_DLSS && upscaler_available(UPSCALE_DLSS); }
+
+bool rt_temporal(void) { return rt_antialias() == AA_TAA || rt_fsr3() || rt_dlss(); }
 
 double upscale_mode_factor(int q) {
-    static const double f[UPQ_COUNT] = {1.3, 1.5, 1.7, 2.0, 3.0};
-    return q == UPQ_COUNT ? 1.0 : q >= 0 && q < UPQ_COUNT ? f[q] : 1.5;  // (UPQ_COUNT: SAVAGEWIND_UPSCALE_AT fsr3-native)
+    static const double f[UPQ_COUNT] = {1.3, 1.5, 1.7, 2.0, 3.0, 1.0};
+    return q >= 0 && q < UPQ_COUNT ? f[q] : 1.5;
 }
 
 // Rendering below the window's size: the 3D scene's render targets at their own scale (vulkan/textures.c). Metal has
@@ -70,49 +94,93 @@ bool upscale_modes_available(void) {
     return on;
 }
 
+// Ultra Performance renders a third of the window's size on each side. A temporal upscaler (FSR 3 / 4, DLSS) is made to
+// bring that to 2160 lines or more; at 1440 the scene is 853 x 480 and the whole image comes out blurred, for hardly
+// more frames than Performance where the CPU is the limit. So it is offered from a 4K window on, and below that a
+// stored Ultra Performance runs as Performance (the setting is kept: it comes back on a 4K window). FSR 1 keeps it at
+// any size. SAVAGEWIND_UPSCALE_ANY=1: offered at any size, as before.
+static volatile int g_out_lines;  // the window's height (output_scale; 0: not known yet)
+bool upscale_mode_offered(int q) {
+    if (q == UPQ_NATIVE) return g_settings.upscaler == UPSCALE_FSR3 || g_settings.upscaler == UPSCALE_FSR4;
+    static int any = -1;
+    if (any < 0) any = getenv("SAVAGEWIND_UPSCALE_ANY") && atoi(getenv("SAVAGEWIND_UPSCALE_ANY")) != 0;
+    if (q != UPQ_ULTRA_PERFORMANCE || any || !(rt_fsr3() || rt_dlss())) return true;
+    return !g_out_lines || g_out_lines >= 2160;
+}
+
+int upscale_quality_now(void) {
+    int q = g_settings.upscale_quality;
+    return upscale_mode_offered(q) ? q : (q == UPQ_NATIVE ? UPQ_QUALITY : UPQ_PERFORMANCE);
+}
+
 double upscale_factor(void) {
     int u = g_settings.upscaler;
     return u != UPSCALE_OFF && upscaler_available(u) && upscale_modes_available()
-               ? upscale_mode_factor(g_settings.upscale_quality) : 1.0;
+               ? upscale_mode_factor(upscale_quality_now()) : 1.0;
 }
 
 // The window's shape over 16:9 while the game's views are widened to fill it, else 1; the field of view's factor in
 // use (rt_persp)
-static volatile float g_view_shape = 1, g_fov = 1;
+static volatile float g_view_shape = 1, g_fov = 1, g_map_extra_y;
+static volatile float g_window_shape = 1;  // the window's shape over 16:9, widened or not (output_window_shape)
 static uint32_t g_world_proj[4];  // tan(fovy / 2), aspect, near, far of the world camera's last matrix (rt_persp), float bits
 
 void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
+    g_out_lines = (int)dh;
     double fit = fmin(dw / 1920.0, dh / 1080.0);
     static double forced = -1, wide_test = -1;
     if (forced < 0) forced = getenv("SAVAGEWIND_SCALE") ? atof(getenv("SAVAGEWIND_SCALE")) : 0;
     if (wide_test < 0) wide_test = getenv("SAVAGEWIND_WIDE_TEST") ? atof(getenv("SAVAGEWIND_WIDE_TEST")) : 0;
     double shape = wide_test > 0 ? wide_test : (dw / dh) / (16.0 / 9.0);
+    g_window_shape = (float)shape;
     // A wider window (21:9, 32:9) sees more to the sides, a taller one (16:10, 4:3: shape < 1) more above and below
-    // (#125); the HUD keeps its 16:9 layout in the middle either way. The start screen and its menus, a 16:9 layout
-    // over 16:9 pictures with no world to show more of, keep the 16:9 picture with bars, and so does the loading screen
-    // (#98: widened, its tip went to the window's edges and its logo stayed in the 16:9 middle).
-    bool reshape = reshape_allowed && fabs(shape - 1.0) > 0.005 && !framepace_title_ui() && !framepace_loading_ui();
+    // (#125); the HUD keeps its 16:9 layout in the middle either way. Taller title screens fill the window too.
+    // Fit wider title/loading layouts to keep their artwork and text aligned (#98). Taller views keep their shape
+    // through the loading overlay so the world doesn't change aspect while fading out or back in.
+    // The frames before the start screen first comes up count as it too (#805): the game makes its layout projection
+    // there, once, and widened then (rt_persp) it kept the window's aspect on the 16:9 start screen, whose artwork came
+    // out 1/shape as wide (a strip in the middle on 32:9).
+    static bool title_seen;
+    if (framepace_title_ui()) title_seen = true;
+    bool title_fit = framepace_title_ui() || !title_seen;
+#ifndef __APPLE__
+    title_fit = title_fit && shape >= 1;  // Vulkan cover-crops the artwork on taller title screens.
+#endif
+    bool reshape = reshape_allowed && fabs(shape - 1.0) > 0.005 && !title_fit &&
+                   (shape < 1 || !framepace_loading_ui());
     if (!reshape) shape = 1.0;
     // render height in units of the Switch's 1080 lines: the window's (Metal: divided by the upscaler's factor)
+    // Video > Render scale: above 100% everything renders bigger than the window and is scaled down to it
+    // (supersampling: the cleanest anti-aliasing, at the GPU's cost); below it smaller, scaled up (faster, blurrier).
+    // MAX_TEX below still caps it. On Vulkan, only the 3D scene (RS_SCENE) scales with render_scale so the UI/HUD
+    // stays sharp at the output resolution (#746).
+    static const double ss_f[RSCALE_COUNT] = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0};
+    int rsi = g_settings.render_scale;
+    double ss = rsi >= 0 && rsi < RSCALE_COUNT ? ss_f[rsi] : 1.0;
 #ifdef __APPLE__
-    double out_div = upscale_factor(), scene_div = 1.0;
+    double out_div = upscale_factor(), scene_div = 1.0, ui_ss = ss, scene_ss = 1.0;
 #else
-    double out_div = 1.0, scene_div = upscale_factor();
+    double out_div = 1.0, scene_div = upscale_factor(), ui_ss = 1.0, scene_ss = ss;
 #endif
-    double h = forced > 0 ? forced : (reshape ? dh / 1080.0 : fit) / out_div;
+    // Near-16:9 integer resolutions like 1366x768 (768 * 16/9 = 1365.33) would otherwise render 1365px wide and
+    // resample at a sub-pixel horizontal offset into the 1366px window (#770); snap <2px rounding to exact 1:1.
+    bool near_fit = !reshape && forced <= 0 && wide_test <= 0 &&
+                    fabs(dw - 1920.0 * fit) < 2.0 && fabs(dh - 1080.0 * fit) < 2.0;
+    double h = forced > 0 ? forced : (reshape ? dh / 1080.0 : fit) / out_div * ui_ss;
     h = fmax(h, 0.1);  // (a tiny window)
-    double sx = h * shape, sy = h;
+    double sx = near_fit ? fmax((dw / 1920.0) / out_div * ui_ss, 0.1) : h * shape;
+    double sy = near_fit ? fmax((dh / 1080.0) / out_div * ui_ss, 0.1) : h;
     double cap = fmin(MAX_TEX / (1920.0 * sx), MAX_TEX / (1080.0 * sy));
     if (cap < 1.0) { sx *= cap; sy *= cap; }
     o->sx = sx; o->sy = sy; o->shape = shape;
     // the 3D scene (BOTW docked: 1600x900, composited into the 1920x1080 final image) at the final image's
-    // resolution, divided by the upscaler's factor
-    double k = 1080.0 / SCENE_LINES / scene_div;
+    // resolution, scaled by Video > Render scale (on Vulkan) and divided by the upscaler's factor
+    double k = 1080.0 / SCENE_LINES / scene_div * scene_ss;
     o->scene_sx = sx * k; o->scene_sy = sy * k;
     double scap = fmin(MAX_TEX / (1920.0 * o->scene_sx), MAX_TEX / (1080.0 * o->scene_sy));
     if (scap < 1.0) { o->scene_sx *= scap; o->scene_sy *= scap; }
-    // where the image goes in the window: fills it when reshaped, else a fitted 16:9 box
-    if (reshape) { o->vw = dw; o->vh = dh; }
+    // where the image goes in the window: fills it when reshaped (or near-16:9 snapped), else a fitted 16:9 box
+    if (reshape || near_fit) { o->vw = dw; o->vh = dh; }
     else { o->vw = 1920.0 * fit; o->vh = 1080.0 * fit; }
     if (wide_test > 0) {
         double f2 = fmin(dw / (1920.0 * wide_test), dh / 1080.0);
@@ -120,6 +188,16 @@ void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
     }
     o->vx = (dw - o->vw) / 2; o->vy = (dh - o->vh) / 2;
     o->crop[0] = o->crop[1] = 0, o->crop[2] = o->crop[3] = 1;
+    bool tall_map = output_tall_map((float)shape);
+    g_map_extra_y = tall_map ? (float)(360 * (1 / shape - 1)) : 0;
+    // Renderers and aspect ratios without the taller map layout keep the centered 16:9 frame (#303).
+    if (reshape && shape < 1 && !tall_map && framepace_map_ui()) {
+        double map_h = o->vh * shape;
+        o->vy += (o->vh - map_h) / 2;
+        o->vh = map_h;
+        o->crop[1] = (1 - shape) / 2;
+        o->crop[3] = shape;
+    }
     // Pause pages keep their 16:9 layout centered while the wider or taller image remains visible around them.
     g_view_shape = (float)o->shape;
     // Video > Field of view: in play only (cutscenes and talks keep the game's framing), eased over about 1/4 s so
@@ -142,6 +220,33 @@ void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
 }
 
 float output_view_shape(void) { return g_view_shape; }
+float output_window_shape(void) { return g_window_shape; }
+float output_map_extra_y(void) { return g_map_extra_y; }
+
+float output_pause_extra_y(void) {
+#ifdef __APPLE__
+    return 0;
+#else
+    static int off = -1;
+    if (off < 0) off = getenv("SAVAGEWIND_NO_HUD_FIX") != NULL;
+    float shape = g_view_shape;
+    return !off && g_settings.hud_edges && shape >= 0.75f && shape < 1 &&
+           framepace_menu_ui() && !framepace_map_ui() ? 360 * (1 / shape - 1) : 0;
+#endif
+}
+
+float output_ui_extra_y(void) { return fmaxf(g_map_extra_y, output_pause_extra_y()); }
+
+// The taller world-map layout is implemented by Vulkan. Very narrow windows keep the console frame.
+bool output_tall_map(float shape) {
+#ifdef __APPLE__
+    return false;
+#else
+    static int off = -1;
+    if (off < 0) off = getenv("SAVAGEWIND_NO_HUD_FIX") != NULL;
+    return !off && shape >= 0.75f && shape < 1 && framepace_map_ui();
+#endif
+}
 
 // The game's perspective views, as each one's matrix is built (tools/patches.py _persp_matrix: sead's
 // PerspectiveProjection; tan_fovy = tan(fovy / 2) at +0xac, aspect at +0xb0, as float bits; near at +0x98). Every 16:9
@@ -290,7 +395,7 @@ bool rt_jitter_on(void) {
     return env >= 0 ? env : rt_temporal();
 }
 
-// The jitter sequence's length: 8, or FSR 3's for its upscale (fsr3_jitter_phases, set by vulkan/exec.c)
+// The jitter sequence's length: 8, or the temporal upscaler's (FSR 3's fsr3_jitter_phases, DLSS's; set by vulkan/exec.c)
 static uint32_t jitter_phases = 8;
 void rt_jitter_set_phases(uint32_t n) { __atomic_store_n(&jitter_phases, n ? n : 8, __ATOMIC_RELAXED); }
 
@@ -353,11 +458,12 @@ void output_scale_screen(double sw, double sh, int iw, int ih, OutScale *o) {
     o->vw *= k; o->vh *= k;
 }
 
-// Console: the game's own size (BOTW: 896 x 896 per cascade); High 2048, Ultra 4096, Extreme 8192. Test override:
+// Console: the game's own size (BOTW: 896 x 896 per cascade); High 2048, Ultra 4096, Extreme 8192; Potato 448, half the
+// game's (softer edges, a quarter of the pixels to draw: for weak GPUs). Test override:
 // SAVAGEWIND_SHADOW_AT=<frame>:<console|high|ultra|extreme|width>,... from that presented frame on (same-view A/B in one
 // run).
 unsigned shadow_map_size(unsigned long long frame) {
-    static const unsigned size[SHADOW_COUNT] = {0, 2048, 4096, 8192};
+    static const unsigned size[SHADOW_COUNT] = {0, 2048, 4096, 8192, 448};
     static int n = -1;
     static unsigned long long at[8];
     static unsigned w[8];
@@ -367,7 +473,7 @@ unsigned shadow_map_size(unsigned long long frame) {
             char name[16] = "";
             if (sscanf(e, "%llu:%15[^,]", &at[n], name) != 2) break;
             w[n++] = !strcmp(name, "console") ? 0 : !strcmp(name, "high") ? 2048 : !strcmp(name, "ultra") ? 4096
-                   : !strcmp(name, "extreme") ? 8192 : (unsigned)atoi(name);
+                   : !strcmp(name, "extreme") ? 8192 : !strcmp(name, "potato") ? 448 : (unsigned)atoi(name);
             e = strchr(e, ',');
             if (e) e++;
         }
@@ -375,5 +481,17 @@ unsigned shadow_map_size(unsigned long long frame) {
     unsigned r = g_settings.shadow_res >= 0 && g_settings.shadow_res < SHADOW_COUNT ? size[g_settings.shadow_res] : 0;
     for (int i = 0; i < n; i++)
         if (frame >= at[i]) r = w[i];
-    return r > 8192 ? 8192 : r;
+    if (r > 8192) r = 8192;
+    // With a temporal upscaler (FSR 3 / 4, DLSS) the scene is drawn smaller by the quality mode's factor, and the
+    // cascades above the console's size follow it: as many shadow texels per drawn pixel as without the upscaler
+    // (Extreme at Quality: 5440 instead of 8192). The cascades cost the same at any scene resolution otherwise, and
+    // where they are most of the frame the upscaler gained nothing. Never under the console's own 896.
+    // SAVAGEWIND_SHADOW_FOLLOW=0: the setting's size, as before.
+    static int follow = -1;
+    if (follow < 0) follow = !getenv("SAVAGEWIND_SHADOW_FOLLOW") || atoi(getenv("SAVAGEWIND_SHADOW_FOLLOW")) != 0;
+    if (follow && r > 896 && (rt_fsr3() || rt_dlss())) {
+        r = (unsigned)(r / upscale_factor() / 64.0 + 0.5) * 64;
+        if (r < 896) r = 896;
+    }
+    return r;
 }

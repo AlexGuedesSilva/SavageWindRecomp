@@ -9,6 +9,7 @@ static uint64_t clock_ns;
 uint64_t plat_now_ns(void) { return clock_ns; }
 static bool in_apparatus = true;  // (runtime/pc_gyro_scene.c: the tilt key's pose is kept there, levels elsewhere)
 bool pc_gyro_keyboard_active(void) { return in_apparatus; }
+bool settings_handheld(void) { return false; }  // (runtime/settings.c: a desktop, no handheld sensors)
 
 
 static void fresh(void) {
@@ -80,9 +81,9 @@ static void mouse_turns(void) {
     assert(!g.tilt_pitch&&!g.tilt_roll&&!g.tilt_yaw);
     motion_tilt_held(true);motion_mouse(10,10);motion_mouse_yaw(1);
     motion_reboot_reset();assert(!g.tilt_held&&!g.tilt_pitch&&!g.tilt_roll&&!g.tilt_yaw);
-    // Physical sensor path still uses the existing conservative camera pitch limit.
-    fresh();g.sensors=g.started=true;g.q=euler_quat(0,89*PI/180,0);
-    update(clock_ns+=10000000);assert(fabs(s.pitch-PITCH_MAX)<1e-7);
+    // Physical sensor pose is preserved near vertical.
+    fresh();g.sensors=g.started=true;g.q=g.aim_q=euler_quat(0,89*PI/180,0);
+    update(clock_ns+=10000000);orientation(89,0,0);
     // Outside an apparatus a let-go tilt levels again, so it never stays in front of a controller's own gyroscope.
     in_apparatus = false;
     fresh();motion_tilt_held(true);motion_mouse(100,-50);motion_mouse_yaw(3);
@@ -92,10 +93,10 @@ static void mouse_turns(void) {
     for(int i=0;i<200;i++)update(clock_ns+=10000000);
     orientation(0,0,0);
     assert(!g.tilt_pitch&&!g.tilt_roll&&!g.tilt_yaw);
-    g.sensors=g.started=true;g.q=euler_quat(0,30*PI/180,0);
+    g.sensors=g.started=true;g.q=g.aim_q=euler_quat(0,30*PI/180,0);
     update(clock_ns+=10000000);assert(s.src>0);
     in_apparatus = true;
-    puts("T+mouse/wheel: two full turns, clutch hold/reposition/resume, explicit O reset, reboot, levelling outside an apparatus and physical pitch limit PASS");
+    puts("T+mouse/wheel: two full turns, clutch hold/reposition/resume, explicit O reset, reboot, levelling outside an apparatus and physical pose near vertical PASS");
 }
 
 static void fast_mouse(void) {

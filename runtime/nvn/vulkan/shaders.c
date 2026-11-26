@@ -15,10 +15,20 @@
 // What the translated shaders depend on besides their binaries: the translator's sources (maxwell_translator_id)
 // and the GLSL -> SPIR-V step's (vk_spirv_id). Caches built from translated shaders (cache/xlate, the pipeline cache,
 // the pipeline list) are valid for one value of this only; both ids are hashes of those sources (Makefile), so
-// builds that do not change them keep the caches.
+// builds that do not change them keep the caches. The device-dependent switches a translation also depends on
+// (maxwell_translation_variant) are not in it: cache/xlate records them per file, and the pipeline caches and list
+// hold their entries by content, so a change of the switches costs the translations of the shaders it reaches, not
+// the caches. vk_shader_version_full adds them: what the precompilation was made under (precompiled.txt), so that the
+// start screen offers it again after such a change.
 const char *vk_shader_version(void) {
     static char v[64];
     if (!v[0]) snprintf(v, sizeof v, "%s/%s", maxwell_translator_id(), vk_spirv_id());
+    return v;
+}
+
+const char *vk_shader_version_full(void) {
+    static __thread char v[128];
+    snprintf(v, sizeof v, "%s+%s", vk_shader_version(), maxwell_translation_variant());
     return v;
 }
 
@@ -43,7 +53,12 @@ void vk_cache_path(char *out, size_t n, const char *name) {
 // disk as cache/xlate/<hash>.bin, so a shader seen in an earlier session costs a file read. The hash covers the bytes
 // the translator reads, the key and the translator's build (a new build of translate.c starts over).
 // The hash is also the translation's id (vk_translate_id): the pipeline list (exec.c) names shaders by it.
+// The variant (maxwell_translation_variant: the device's global memory switches) is not in the hash: a file records
+// it, and only a translation that reads global memory made under another variant is a miss (translated again, the
+// file replaced). So a switch that changes keeps every other translation, and the pipeline list stays valid.
 typedef struct { char magic[4]; uint32_t info_size, msl_len, bin_size; ShaderKey key; int32_t stage; } XlateHeader;
+#define XLATE_MAGIC "SWX3"  // (SWX2: without the variant record; its folder is removed, vk_cache_cleanup)
+#define XLATE_VARIANT 64    // bytes of the variant string in a file
 #define XLATE_TAB 16384
 static struct { uint64_t h; ShaderInfo *si; } xlate_tab[XLATE_TAB];
 static struct { const ShaderInfo *si; uint64_t h; } xlate_ids[XLATE_TAB];  // the other way round
@@ -58,11 +73,24 @@ static uint64_t hash64(uint64_t h, const void *p, size_t n) {
 
 // want: the header the file must have (all but msl_len), or NULL to take the one in the file (by id: the hash
 // covers it) when it is sane and of that stage.
-// A file: the header, the ShaderInfo, the GLSL's deflated size and the GLSL deflated (zlib: a sixth of the size). In
-// cache/xlate/<id>/ (the translator's id, vk_cache_dir_id): another build's folder is removed (vk_cache_cleanup).
+// A file: the header, the ShaderInfo, the variant it was made under (XLATE_VARIANT bytes), the GLSL's deflated size
+// and the GLSL deflated (zlib: a sixth of the size). In cache/xlate/<id>/ (the translator's id and the file format,
+// xlate_dir_id): another build's folder is removed (vk_cache_cleanup).
+static char xlate_dir[20];
+static pthread_once_t xlate_dir_once = PTHREAD_ONCE_INIT;
+static void xlate_dir_init(void) {
+    char v[96];
+    snprintf(v, sizeof v, "%s/%s", maxwell_translator_id(), XLATE_MAGIC);
+    snprintf(xlate_dir, sizeof xlate_dir, "%s", vk_cache_dir_id(v));
+}
+static const char *xlate_dir_id(void) {  // (once: the cleanup thread, the pre-warm's and the precompile's workers ask at the same time)
+    pthread_once(&xlate_dir_once, xlate_dir_init);
+    return xlate_dir;
+}
+
 static void xlate_path(char *path, size_t n, uint64_t h) {
     char name[96];
-    snprintf(name, sizeof name, "xlate/%s/%016llx.xlz", vk_cache_dir_id(maxwell_translator_id()), (unsigned long long)h);
+    snprintf(name, sizeof name, "xlate/%s/%016llx.xlz", xlate_dir_id(), (unsigned long long)h);
     vk_cache_path(path, n, name);
 }
 
@@ -78,14 +106,24 @@ static ShaderInfo *xlate_load(uint64_t h, const XlateHeader *want, int stage) {
         ok = !memcmp(&hd, want, offsetof(XlateHeader, msl_len)) && hd.bin_size == want->bin_size &&
              !memcmp(&hd.key, &want->key, sizeof hd.key) && hd.stage == want->stage;
     else if (ok)
-        ok = !memcmp(hd.magic, "SWX2", 4) && hd.info_size == sizeof(ShaderInfo) && hd.stage == stage && hd.msl_len;
+        ok = !memcmp(hd.magic, XLATE_MAGIC, 4) && hd.info_size == sizeof(ShaderInfo) && hd.stage == stage && hd.msl_len;
     uint32_t zn = 0;
     if (ok) {
         si = malloc(sizeof *si);
         char *msl = malloc(hd.msl_len + 1);
         uint8_t *z = NULL;
-        bool got = si && msl && fread(si, sizeof *si, 1, f) == 1 && fread(&zn, 4, 1, f) == 1 && zn < (64u << 20) &&
-                   (z = malloc(zn ? zn : 1)) && fread(z, 1, zn, f) == zn && si->stage == hd.stage;
+        char variant[XLATE_VARIANT];
+        bool got = si && msl && fread(si, sizeof *si, 1, f) == 1 && fread(variant, sizeof variant, 1, f) == 1 &&
+                   fread(&zn, 4, 1, f) == 1 && zn < (64u << 20) && (z = malloc(zn ? zn : 1)) && fread(z, 1, zn, f) == zn &&
+                   si->stage == hd.stage;
+        variant[XLATE_VARIANT - 1] = 0;
+        // (made under other global memory switches: only a shader that reads global memory translates differently)
+        if (got && si->uses_gmem && strcmp(variant, maxwell_translation_variant())) {
+            static int nlog;
+            if (nlog++ < 3) LOG("[xlate] translation %016llx made under other global memory switches (%s, now %s): translated again\n",
+                                (unsigned long long)h, variant, maxwell_translation_variant());
+            got = false;
+        }
         uLongf len = hd.msl_len;
         if (got && uncompress((Bytef *)msl, &len, z, zn) == Z_OK && len == hd.msl_len) {
             msl[hd.msl_len] = 0;
@@ -152,7 +190,7 @@ static void xlate_store(uint64_t h, const XlateHeader *hd, const ShaderInfo *si)
         made = 1;
         vk_cache_path(path, sizeof path, "xlate");
         mkdir(path, 0755);
-        snprintf(name, sizeof name, "xlate/%s", vk_cache_dir_id(maxwell_translator_id()));
+        snprintf(name, sizeof name, "xlate/%s", xlate_dir_id());
         vk_cache_path(path, sizeof path, name);
         mkdir(path, 0755);
     }
@@ -164,13 +202,17 @@ static void xlate_store(uint64_t h, const XlateHeader *hd, const ShaderInfo *si)
     bool ok = compress2(z, &zn, (const Bytef *)si->msl, hd->msl_len, 1) == Z_OK;
     ShaderInfo copy = *si;
     copy.msl = NULL;
+    char variant[XLATE_VARIANT] = {0};
+    snprintf(variant, sizeof variant, "%s", maxwell_translation_variant());
     uint32_t zn32 = (uint32_t)zn;
     FILE *f = ok ? fopen(tmp, "wb") : NULL;
-    ok = f && fwrite(hd, sizeof *hd, 1, f) == 1 && fwrite(&copy, sizeof copy, 1, f) == 1 && fwrite(&zn32, 4, 1, f) == 1 &&
-         fwrite(z, 1, zn, f) == zn;
+    ok = f && fwrite(hd, sizeof *hd, 1, f) == 1 && fwrite(&copy, sizeof copy, 1, f) == 1 &&
+         fwrite(variant, sizeof variant, 1, f) == 1 && fwrite(&zn32, 4, 1, f) == 1 && fwrite(z, 1, zn, f) == zn;
     if (f && fclose(f)) ok = false;
     free(z);
-    if (f && (!ok || rename(tmp, path) != 0)) remove(tmp);  // (another thread may have stored it first)
+    // (another thread may have stored it first; a file of another variant is replaced)
+    if (f && ok && !vk_replace_file(tmp, path)) ok = false;
+    if (f && !ok) remove(tmp);
 }
 
 // A cache folder's name for an id (TRANSLATOR_ID / SPIRV_ID are 16 hex digits; built without the Makefile, a date)
@@ -189,7 +231,7 @@ const char *vk_cache_dir_id(const char *id) {
 // that updates do not pile them up (the whole game's precompiled shaders are ~0.4 GB). Runs on a thread of its own.
 static void *cleanup_thread(void *arg) {
     (void)arg;
-    const char *keep[2] = {vk_cache_dir_id(maxwell_translator_id()), vk_cache_dir_id(vk_spirv_id())};
+    const char *keep[2] = {xlate_dir_id(), vk_cache_dir_id(vk_spirv_id())};
     static const char *const sub[2] = {"xlate", "spirv"};
     int removed = 0;
     for (int i = 0; i < 2; i++) {
@@ -402,17 +444,47 @@ int vk_keylog_read(VkKeyLogEntry **out) {
 }
 
 // The translation's id (its cache/xlate name) and the header its file has
-static uint64_t xlate_id(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key, XlateHeader *hd) {
+static uint64_t xlate_id_as(const char *id, const uint8_t *code, size_t max_size, int stage, const ShaderKey *key,
+                            XlateHeader *hd) {
     memset(hd, 0, sizeof *hd);
-    memcpy(hd->magic, "SWX2", 4);
+    memcpy(hd->magic, XLATE_MAGIC, 4);
     hd->info_size = sizeof(ShaderInfo);
     hd->bin_size = (uint32_t)maxwell_binary_size(code, max_size, stage);
     hd->key = *key;
     hd->stage = stage;
-    const char *id = maxwell_translator_id();
     uint64_t h = hash64(0xcbf29ce484222325ull, id, strlen(id));
     h = hash64(h, hd, sizeof *hd);
     h = hash64(h, code, hd->bin_size);
+    if (maxwell_wet_lighting(code, max_size, stage)) h = hash64(h, "wet", 3);  // (Video > Wet grass fix: its own translation)
+    return h ? h : 1;
+}
+
+static uint64_t xlate_id(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key, XlateHeader *hd) {
+    return xlate_id_as(maxwell_translator_id(), code, max_size, stage, key, hd);
+}
+
+// The id a translation of this binary with this key has (precompile.c: the pipeline seed names shaders by binary
+// hash and key, the list by this)
+uint64_t vk_translate_id_for(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key) {
+    XlateHeader hd;
+    // (the seed's export only) SAVAGEWIND_SEED_LIST_ID=<translator id>: the ids as a list of a build before the
+    // variant change named them (its translator id with the switches in it, the SWX2 file format), so a playthrough's
+    // list from such a build can be exported once
+    // SAVAGEWIND_SEED_TRANSLATOR=<translator id>: the ids as another build of the same file format named them (a
+    // player's list from a problem report: --seed-from-report)
+    const char *other = getenv("SAVAGEWIND_SEED_TRANSLATOR");
+    if (other && *other) return xlate_id_as(other, code, max_size, stage, key, &hd);
+    const char *old = getenv("SAVAGEWIND_SEED_LIST_ID");
+    if (!old || !*old) return xlate_id(code, max_size, stage, key, &hd);
+    memset(&hd, 0, sizeof hd);
+    memcpy(hd.magic, "SWX2", 4);
+    hd.info_size = sizeof(ShaderInfo);
+    hd.bin_size = (uint32_t)maxwell_binary_size(code, max_size, stage);
+    hd.key = *key;
+    hd.stage = stage;
+    uint64_t h = hash64(0xcbf29ce484222325ull, old, strlen(old));
+    h = hash64(h, &hd, sizeof hd);
+    h = hash64(h, code, hd.bin_size);
     return h ? h : 1;
 }
 
@@ -877,6 +949,93 @@ static const char taa_instability[] =
         "  imageStore(hist_i, p, h);\n"
         "  imageStore(instab_i, p, vec4(instab));\n"
         "}\n";
+// The light TAA (exec.c mvec_taa, the default; SAVAGEWIND_TAA=full: the seven passes above): one pass. The vector of
+// the nearest surface among the pixel and its 4 diagonal neighbours (edges move with what is in front); the history
+// there (Catmull-Rom, 5 bilinear taps), clipped in YCoCg to the 3x3's mean +- 1.5 standard deviations (0.9 with
+// motion) and its extremes; the new sample a Lanczos 2 of the 3x3 at their jittered distances, deringed to the 3x3.
+// The history's .a counts the frames accumulated (/ 16): the blend is 1 / count down to 0.08 on a still pixel (0.3
+// in fast motion), more where the reactive mask (the vectors' .z: blended effects) is set (a plain blend: weighting
+// the samples by 1 / (1 + luma) darkened the scene, whose values are not display-range). No disocclusion or shading-change detection, no thin-feature locks: the
+// clipping alone drops stale history. The seven passes cost the GPU ~2.5 ms at 1440p (RTX 3060), this one ~0.5.
+static const char taa_lite[] =
+        "layout(set = 0, binding = 0) uniform sampler2D color_t;\n"
+        "layout(set = 0, binding = 1) uniform sampler2D vec_t;\n"
+        "layout(set = 0, binding = 2) uniform sampler2D depth_t;\n"
+        "layout(set = 0, binding = 3) uniform sampler2D hist_t;\n"
+        "layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D hist_i;\n"
+        "layout(set = 0, binding = 9, rgba16f) uniform writeonly image2D out_i;\n"
+        "float lanczos2_sq(float x2) {\n"
+        "  x2 = min(x2, 4.0);\n"
+        "  float a = 0.4 * x2 - 1.0, b = 0.25 * x2 - 1.0;\n"
+        "  return (25.0 / 16.0 * a * a - 9.0 / 16.0) * (b * b);\n"
+        "}\n"
+        "vec4 history(vec2 uv) {\n"
+        "  vec2 sp = uv * pc.size.xy, tc = floor(sp - 0.5) + 0.5, f = sp - tc;\n"
+        "  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));\n"
+        "  vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
+        "  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));\n"
+        "  vec2 w3 = f * f * (-0.5 + 0.5 * f);\n"
+        "  vec2 w12 = w1 + w2;\n"
+        "  vec2 t0 = (tc - 1.0) * pc.size.zw, t3 = (tc + 2.0) * pc.size.zw, t12 = (tc + w2 / w12) * pc.size.zw;\n"
+        "  float a = w12.x * w0.y, b = w0.x * w12.y, c = w12.x * w12.y, d = w3.x * w12.y, e = w12.x * w3.y;\n"
+        "  vec4 s = textureLod(hist_t, vec2(t12.x, t0.y), 0.0) * a + textureLod(hist_t, vec2(t0.x, t12.y), 0.0) * b +\n"
+        "           textureLod(hist_t, t12, 0.0) * c + textureLod(hist_t, vec2(t3.x, t12.y), 0.0) * d +\n"
+        "           textureLod(hist_t, vec2(t12.x, t3.y), 0.0) * e;\n"
+        "  return s / (a + b + c + d + e);\n"
+        "}\n"
+        "void main() {\n"
+        "  ivec2 p = pixel();\n"
+        "  if (!onscreen(p)) return;\n"
+        "  vec2 uv = (vec2(p) + 0.5) * pc.size.zw, J = pc.jit.xy;\n"
+        "  float dn = texelFetch(depth_t, p, 0).r;\n"
+        "  ivec2 pn = p;\n"
+        "  for (int i = 0; i < 4; i++) {\n"
+        "    ivec2 q = clampp(p + ivec2((i & 1) * 2 - 1, (i >> 1) * 2 - 1));\n"
+        "    float d = texelFetch(depth_t, q, 0).r;\n"
+        "    if (d < dn) { dn = d; pn = q; }\n"
+        "  }\n"
+        "  vec4 v = texelFetch(vec_t, pn, 0);\n"
+        "  bool has = v.a >= 0.25;\n"
+        "  vec2 mv = has ? vec2(-0.5 * v.x, 0.5 * v.y) : vec2(0.0);\n"
+        "  vec2 ruv = uv + mv;\n"
+        "  bool fresh = pc.st.x < 0.5 || !has || !inside(ruv);\n"
+        "  vec4 c4 = texelFetch(color_t, p, 0);\n"
+        "  vec3 up = vec3(0.0), mu = vec3(0.0), m2 = vec3(0.0), lo = vec3(65504.0), hi = vec3(-65504.0);\n"
+        "  float uw = 0.0, n = 0.0;\n"
+        "  for (int y = -1; y <= 1; y++)\n"
+        "    for (int x = -1; x <= 1; x++) {\n"
+        "      ivec2 q = p + ivec2(x, y);\n"
+        "      if (!onscreen(q)) continue;\n"
+        "      vec3 s = ycocg(max(texelFetch(color_t, q, 0).rgb, vec3(0.0)));\n"
+        "      vec2 o = vec2(x, y) - J;\n"
+        "      float w = lanczos2_sq(dot(o, o));\n"
+        "      up += s * w; uw += w;\n"
+        "      mu += s; m2 += s * s; n += 1.0;\n"
+        "      lo = min(lo, s); hi = max(hi, s);\n"
+        "    }\n"
+        "  mu /= n;\n"
+        "  vec3 sigma = sqrt(max(m2 / n - mu * mu, vec3(0.0)));\n"
+        "  up = uw > FP16_MIN ? clamp(up / uw, lo, hi) : ycocg(max(c4.rgb, vec3(0.0)));\n"
+        "  vec3 res = up;\n"
+        "  float cnt = 1.0;\n"
+        "  if (!fresh) {\n"
+        "    vec4 h = history(ruv);\n"
+        "    vec3 hc = ycocg(max(h.rgb, vec3(0.0)));\n"
+        "    float prevn = clamp(h.a, 0.0, 1.0) * 16.0, vel = v4k(mv), react = clamp(v.z, 0.0, 1.0);\n"
+        "    float g = mix(1.5, 0.9, clamp(vel / 8.0, 0.0, 1.0));\n"
+        "    vec3 bmin = max(mu - g * sigma, lo), bmax = min(mu + g * sigma, hi);\n"
+        "    vec3 ctr = 0.5 * (bmin + bmax), ext = 0.5 * (bmax - bmin) + 1e-5, dl = hc - ctr, u3 = abs(dl / ext);\n"
+        "    float mx = max(u3.x, max(u3.y, u3.z));\n"
+        "    if (mx > 1.0) hc = ctr + dl / mx;\n"
+        "    float alpha = max(1.0 / (prevn + 1.0), mix(0.08, 0.3, clamp(vel / 16.0, 0.0, 1.0)));\n"
+        "    alpha = max(alpha, 0.5 * react);\n"
+        "    res = mix(hc, up, alpha);\n"
+        "    cnt = min(prevn + 1.0, 16.0);\n"
+        "  }\n"
+        "  vec3 o = max(rgb(res), vec3(0.0));\n"
+        "  imageStore(hist_i, p, vec4(o, cnt / 16.0));\n"
+        "  imageStore(out_i, p, vec4(o, c4.a));\n"
+        "}\n";
 static const char taa_resolve[] =
         "layout(set = 0, binding = 0) uniform sampler2D color_t;\n"
         "layout(set = 0, binding = 1) uniform sampler2D dil_t;\n"
@@ -1012,6 +1171,27 @@ static const char *builtin_src(const char *name, int *stage) {
                "layout(location = 0) in vec2 uv;\n"
                "layout(location = 0) out vec4 o;\n"
                "void main() { o = vec4(texture(t, uv).rgb, 1.0); }\n";
+    }
+    // Accessibility > Colour vision (runtime/colour_vision.h; exec.c vk_present_draw): present.frag with the
+    // correction's 3x3 matrix applied in linear light, rows r0..r2 after the vertex shader's 32 bytes. r0.w = 1: the
+    // picture is already linear (HDR's float picture), else it holds sRGB-encoded values (the game's 8-bit image, read
+    // raw), decoded and encoded again around the matrix.
+    if (!strcmp(name, "present_cvd.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { layout(offset = 32) vec4 r0; vec4 r1; vec4 r2; } pc;\n"
+               "layout(location = 0) in vec2 uv;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 enc(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }\n"
+               "vec3 dec(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }\n"
+               "void main() {\n"
+               "  vec3 c = texture(t, uv).rgb;\n"
+               "  bool lin = pc.r0.w > 0.5;\n"
+               "  vec3 l = lin ? c : dec(clamp(c, 0.0, 1.0));\n"
+               "  vec3 m = max(vec3(dot(pc.r0.xyz, l), dot(pc.r1.xyz, l), dot(pc.r2.xyz, l)), vec3(0.0));\n"
+               "  o = vec4(lin ? m : enc(min(m, vec3(1.0))), 1.0);\n"
+               "}\n";
     }
     // ---- post passes before the present (Video tab "Anti-aliasing" / "Upscaler"): exec.c vk_present_draw.
     // Each draws a fullscreen triangle into an image the size of its output; push constants: two vec4.
@@ -1150,7 +1330,10 @@ static const char *builtin_src(const char *name, int *stage) {
                "  tapf(ac, aw, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, gC);\n"
                "  tapf(ac, aw, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, oC);\n"
                "  tapf(ac, aw, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, nC);\n"
-               "  o = vec4(min(mx, max(mn, ac / aw)), alpha);\n"
+               "  vec3 bilerp = mix(mix(fC, gC, pp.x), mix(jC, kC, pp.x), pp.y);\n"
+               "  vec3 c = aw > 1.0 / 32768.0 ? ac / aw : bilerp;\n"
+               "  if (isnan(c.r) || isnan(c.g) || isnan(c.b) || isinf(c.r) || isinf(c.g) || isinf(c.b)) c = bilerp;\n"
+               "  o = vec4(clamp(c, mn, mx), alpha);\n"
                "}\n";
     }
     // FSR 1 RCAS: contrast-adaptive sharpening of the EASU output (same size). a.x = sharpness (exp2(-stops)),
@@ -1180,6 +1363,8 @@ static const char *builtin_src(const char *name, int *stage) {
                "  vec3 lobeRGB = max(-hitMin, hitMax);\n"
                "  float lobe = max(-(0.25 - 1.0 / 16.0), min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * pc.a.x * nz;\n"
                "  vec3 r = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);\n"
+               "  if (isnan(r.r) || isnan(r.g) || isnan(r.b) || isinf(r.r) || isinf(r.g) || isinf(r.b)) r = e;\n"
+               "  r = clamp(r, vec3(0.0), vec3(1.0));\n"
                "  o = vec4(pc.b.z > 0.5 ? r * r : r, texelFetch(t, ip, 0).a);\n"
                "}\n";
     }
@@ -1263,11 +1448,11 @@ static const char *builtin_src(const char *name, int *stage) {
     }
     if (!strncmp(name, "taa_", 4)) {
         static const char *const names[] = {"taa_prepare.comp", "taa_shade_src.comp", "taa_shade_down.comp", "taa_shade.comp",
-                                            "taa_reactivity.comp", "taa_instability.comp", "taa_resolve.comp"};
+                                            "taa_reactivity.comp", "taa_instability.comp", "taa_resolve.comp", "taa_lite.comp"};
         static const char *const bodies[] = {taa_prepare, taa_shade_src, taa_shade_down, taa_shade, taa_reactivity,
-                                             taa_instability, taa_resolve};
-        static char *src[7];
-        for (int i = 0; i < 7; i++) {
+                                             taa_instability, taa_resolve, taa_lite};
+        static char *src[8];
+        for (int i = 0; i < 8; i++) {
             if (strcmp(name, names[i])) continue;
             if (!src[i]) {
                 size_t a = strlen(taa_common), b = strlen(bodies[i]);
@@ -1308,7 +1493,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "  float peak = -1.0 / mix(8.0, 5.0, clamp(pc.a.x, 0.0, 1.0));\n"
                "  float w = amp.g * peak;\n"
                "  vec3 r = (b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w);\n"
-               "  o = vec4(clamp(r, 0.0, 1.0), e4.a);\n"
+               "  o = vec4(max(r, 0.0), e4.a);\n"
                "}\n";
     }
     // Colour grading of the 3D scene (Video > Colour; exec.c scene_post, runtime/color_grade.h). The scene holds
@@ -1330,6 +1515,7 @@ static const char *builtin_src(const char *name, int *stage) {
     "  vec3 c = s.rgb * pc.g.rgb;\n"                                                                            \
     "  float y = dot(c, vec3(0.2126, 0.7152, 0.0722));\n"                                                       \
     "  c = max(mix(vec3(y), c, pc.a.x), 0.0);\n"                                                                \
+    "  vec3 hdr = max(c - vec3(1.0), vec3(0.0));\n"                                                             \
     "  vec3 x = enc(min(c, 1.0));\n"                                                                            \
     "  vec3 lo = 0.5 * pow(2.0 * x, vec3(pc.g.w)), hi = 1.0 - 0.5 * pow(max(2.0 - 2.0 * x, 0.0), vec3(pc.g.w));\n" \
     "  x = mix(lo, hi, step(0.5, x));\n"                                                                        \
@@ -1338,7 +1524,7 @@ static const char *builtin_src(const char *name, int *stage) {
     "  vec3 l = texture(t1, u * ((pc.a.z - 1.0) / pc.a.z) + 0.5 / pc.a.z).rgb;\n"                               \
     "  x = mix(x, clamp(l, 0.0, 1.0), pc.a.y);\n"                                                               \
     "#endif\n"                                                                                                  \
-    "  o = vec4(dec(x), s.a);\n"                                                                                \
+    "  o = vec4(dec(x) + hdr, s.a);\n"                                                                          \
     "}\n"
         if (name[5] == '_')
             return "#version 450\n#define LUT 1\nlayout(set = 0, binding = 1) uniform sampler3D t1;\n" GRADE_BODY;

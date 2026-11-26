@@ -1,5 +1,6 @@
 #include <sys/mman.h>
 #include "paths.h"
+#include "prof.h"
 #include "settings.h"
 #include "ui/menu.h"
 // Metal renderer for the NVN layer: window, textures, command execution, presentation.
@@ -217,6 +218,7 @@ void renderer_get_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }
 void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
 void renderer_get_scene_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }  // (one scale for every target here)
 bool renderer_gpu_rtx(void) { return false; }  // (Video > Upscaler: DLSS needs an NVIDIA RTX GPU)
+const char *vk_hdr_icc_description(void) { return "HDR output is not available in the Metal backend."; }
 
 static bool tex_scalable(const NvnTexture *t) {
     if (getenv("SAVAGEWIND_NO_SCALE")) return false;
@@ -1049,6 +1051,7 @@ void backend_present(NvnTexture *t) {
     }
     frames++;
     total_frames++;
+    prof_frame(total_frames);  // (the profiler: a new frame starts here, for every thread's events)
     g_frame_counter++;
     extern void input_frame(uint64_t frame);
     input_frame(total_frames);
@@ -1061,6 +1064,8 @@ void backend_present(NvnTexture *t) {
     reboot_test_frame(total_frames);
     extern void test_warp_frame(uint64_t frame);  // runtime/services/test_warp.c (SAVAGEWIND_TEST_TIME)
     test_warp_frame(total_frames);
+    extern void weather_frame(void);  // runtime/weather.c (Cheats > Weather, `weather`)
+    weather_frame();
     extern void control_frame(uint64_t frame);  // runtime/control.c (SAVAGEWIND_CONTROL)
     control_frame(total_frames);
     static long shot_every = -1;
@@ -1110,6 +1115,7 @@ void ui_window_init(void) {
     if (window) return;
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     settings_load();
+    { extern void motion_before_sdl_init(void); motion_before_sdl_init(); }  // (hle/motion.c: Steam Input's hidden pads)
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
     // Video > Window size (runtime/window_size.c: pixels; SDL's window size is pixels / the display's pixel density)
     winsize_refresh(NULL);

@@ -14,15 +14,18 @@
 // ---- start / mode (exec.c vk_exec_init, before any command)
 void rec_init(void);
 bool rec_on(void);  // commands go through the recorder thread
+bool rec_on_recorder(void);  // the calling thread is the recorder (inside a rec_custom call): it must queue nothing
 
 // ---- command buffers, submissions
 void rec_BeginCommandBuffer(VkCommandBuffer cb);  // ONE_TIME_SUBMIT
 void rec_EndCommandBuffer(VkCommandBuffer cb);
-// Submits si (up to 2 command buffers, 1 wait, 2 signals; nothing chained) on g_vk.queue. seq: the timeline value it
+// Submits si (up to 2 command buffers, 2 waits, 2 signals; nothing chained) on g_vk.queue. seq: the timeline value it
 // signals, which rec_submitted() reaches once the driver has it.
 void rec_QueueSubmit2(const VkSubmitInfo2 *si, uint64_t seq);
 // n writes of one descriptor each (buffer or image info), in order with the commands
 void rec_UpdateDescriptorSets(uint32_t n, const VkWriteDescriptorSet *w);
+// fn(arg) made by the recorder in its turn, in order with the commands (at once with the recorder off)
+void rec_custom(void (*fn)(void *), void *arg);
 
 // ---- waits (any thread)
 uint64_t rec_submitted(void);           // the latest submission handed to the driver (the timeline value it signals)
@@ -50,6 +53,10 @@ void rec_CmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t n, co
 void rec_CmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkIndexType type);
 void rec_CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t off, uint32_t size,
                           const void *data);
+// A motion program's push constants (mvec.h MVEC_PUSH, the vertex stage's) for the scene draw mvec_draw_commit numbered
+// seq: asked of mvec_resolve when the command is recorded, not when it is queued (the thread that works them out may
+// not be done yet)
+void rec_CmdPushConstantsMvec(VkCommandBuffer cb, VkPipelineLayout layout, uint32_t seq);
 void rec_CmdDraw(VkCommandBuffer cb, uint32_t count, uint32_t inst, uint32_t first, uint32_t first_inst);
 void rec_CmdDrawIndexed(VkCommandBuffer cb, uint32_t count, uint32_t inst, uint32_t first, int32_t base, uint32_t first_inst);
 void rec_CmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z);
